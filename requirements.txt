@@ -1,0 +1,4 @@
+aiohttp
+faster-whisper
+numpy
+zeroconf

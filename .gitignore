@@ -1,0 +1,11 @@
+# Your own settings, with your own addresses in them.
+config.json
+
+# Downloaded Whisper models
+models/
+
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/

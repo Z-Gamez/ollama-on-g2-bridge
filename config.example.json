@@ -1,0 +1,17 @@
+{
+  "host": "0.0.0.0",
+  "port": 8770,
+  "mdns": true,
+  "ollama_url": "http://127.0.0.1:11434",
+  "ollama_model": "qwen3:4b",
+  "whisper_model": "small.en",
+  "whisper_device": "auto",
+  "whisper_models_dir": "models",
+  "language": "en",
+  "tools": true,
+  "allow_shell": false,
+  "apps": {
+    "_comment": "Optional extras. Steam games and Start Menu shortcuts are found automatically; add anything else here as \"spoken name\": \"path or URI\".",
+    "my notes": "C:/Users/you/Documents/notes.txt"
+  }
+}
