@@ -337,6 +337,17 @@ def run_command(command: str, timeout: int = 30) -> str:
 # --------------------------------------------------------------------------
 
 
+def _fn(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": properties, "required": required},
+        },
+    }
+
+
 def schemas(allow_shell: bool) -> list[dict]:
     tools = [
         {
@@ -416,6 +427,39 @@ def schemas(allow_shell: bool) -> list[dict]:
                 },
             },
         },
+        _fn("control_media", "Control music/video playing on the computer: play, pause, skip, previous, volume, mute. "
+            "Use for 'pause the music', 'next song', 'turn it up', 'set volume to 30'.",
+            {"action": {"type": "string", "enum": ["play_pause", "next", "previous", "stop", "volume_up",
+                                                    "volume_down", "set_volume", "mute"]},
+             "amount": {"type": "integer", "description": "Percent, for set_volume or how much to change it"}},
+            ["action"]),
+        _fn("close_app", "Close an open app or game window on the computer, like clicking its X.",
+            {"name": {"type": "string", "description": "App or window name, e.g. 'Steam', 'Chrome'"}}, ["name"]),
+        _fn("list_windows", "List the windows currently open on the computer.", {}, []),
+        _fn("lock_computer", "Lock the computer's screen.", {}, []),
+        _fn("look_at_screen", "Look at the computer's screen and answer a question about it. Use for 'what's on "
+            "my screen', 'read this error', 'what does this say', 'summarise this page'.",
+            {"question": {"type": "string", "description": "What to find out from the screen"}}, ["question"]),
+        _fn("read_clipboard", "Read the text the user last copied on the computer. Use for 'summarise what I "
+            "copied', 'explain my clipboard', 'translate what I copied'.", {}, []),
+        _fn("copy_to_clipboard", "Put text on the computer's clipboard so the user can paste it.",
+            {"text": {"type": "string"}}, ["text"]),
+        _fn("system_status", "Check the computer's CPU, memory, GPU, disk and battery.", {}, []),
+        _fn("remember", "Save a fact the user wants remembered for later, e.g. 'I parked on level 3', "
+            "'my locker code is 4412'.", {"fact": {"type": "string", "description": "The fact, in third person"}},
+            ["fact"]),
+        _fn("forget", "Delete remembered facts about something, or 'everything'.",
+            {"about": {"type": "string"}}, ["about"]),
+        _fn("set_timer", "Start a timer or reminder. Give minutes/seconds for a countdown, or 'at' for a clock "
+            "time like '5pm' or '17:30'.",
+            {"minutes": {"type": "number"}, "seconds": {"type": "number"},
+             "at": {"type": "string", "description": "Clock time, e.g. '5:30pm'"},
+             "label": {"type": "string", "description": "What it's for, e.g. 'pasta'"}}, []),
+        _fn("cancel_timer", "Cancel a running timer by label, or all of them.",
+            {"label": {"type": "string"}}, []),
+        _fn("list_timers", "Say which timers are running and how long is left.", {}, []),
+        _fn("get_weather", "Current weather and forecast. Leave place empty for where the user is now.",
+            {"place": {"type": "string", "description": "City, only if the user named one"}}, []),
     ]
     if allow_shell:
         tools.append(

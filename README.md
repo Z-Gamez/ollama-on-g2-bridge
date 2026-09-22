@@ -13,10 +13,26 @@ Nothing leaves your network. No cloud, no API keys, no accounts.
 
 - **Speech to text** with [faster-whisper](https://github.com/SYSTRAN/faster-whisper),
   locally. The G2 microphone streams 16 kHz PCM straight in.
+- **Knows when you've finished talking.** Silero voice detection (bundled with
+  faster-whisper) sends the question about a second after you stop, so there is
+  no second tap. It tells a voice from a fan or a TV by what the sound is, not
+  how loud it is.
 - **Answers** via [Ollama](https://ollama.com), running whatever model you like.
-- **Acts on your computer** — launches apps and Steam games, opens web pages,
-  reads news headlines, searches the web.
+- **Acts on your computer:**
+  - launches and closes apps and Steam games
+  - controls music and volume (play, pause, skip, "set volume to 30")
+  - **looks at your screen** — "what does this error say?" (needs a vision model)
+  - reads your clipboard — "summarise what I copied"
+  - locks the computer, reports CPU / GPU / memory / battery
+- **Remembers things** you ask it to ("remember I parked on level 3"), in a JSON
+  file on your machine.
+- **Timers and reminders** that ring on the computer and pop up on the lens.
+- **Weather** for where your phone is, from Open-Meteo (no key, no account).
+- **News** from RSS, **web search** from DuckDuckGo.
+- **Live captions** — continuous transcription of the people around you, on your
+  lens. With a multilingual Whisper model it translates to English as it goes.
 - **Wake phrase** — say "hey ollama" instead of tapping.
+- **Photos** — take one on your phone and ask about it.
 
 ## Requirements
 
@@ -25,6 +41,9 @@ Nothing leaves your network. No cloud, no API keys, no accounts.
 - Windows, macOS or Linux. App launching is richest on Windows (Steam library
   and Start Menu are detected automatically).
 - An NVIDIA GPU is optional but makes transcription roughly ten times faster.
+- For the screen and photo features, a vision model: `ollama pull qwen2.5vl:3b`
+  (or any model Ollama lists with vision capability — it is picked up
+  automatically).
 
 ## Install
 
@@ -108,7 +127,13 @@ defaults are in `DEFAULTS` at the top of `g2_bridge.py`.
 | `whisper_device` | `auto` | `auto`, `cuda` or `cpu`. |
 | `whisper_models_dir` | `models` | Point at an existing cache to reuse models. |
 | `wake_phrase` | `hey ollama` | What wakes it. |
-| `tools` | `true` | Let the model launch apps, open pages and search. |
+| `end_silence_seconds` | `1.0` | How long a pause sends the question when auto-send is on. |
+| `vision_model` | *(auto)* | Model for screen and photo questions. Empty picks the first one with vision. |
+| `units` | `auto` | `imperial`, `metric`, or `auto` (imperial on a US locale). |
+| `home_location` | *(empty)* | Weather location when the phone doesn't share one, e.g. `"Seattle"`. |
+| `memory_file` | `memory.json` | Where "remember that..." is kept. |
+| `tools` | `true` | Let the model act on the computer at all. |
+| `disabled_tools` | `[]` | Switch off individual tools, e.g. `["lock_computer", "read_clipboard"]`. |
 | `allow_shell` | `false` | **Raw shell access. See below.** |
 | `apps` | `{}` | Extra launch targets: `"spoken name": "path or URI"`. |
 | `news_feeds` | BBC, NPR, Guardian | RSS sources for headlines. |
@@ -128,6 +153,17 @@ plus a shell is a bad combination; "open Steam" and something destructive are
 one misheard word apart. Turn it on with `"allow_shell": true` only if you want
 that, and know that every command it runs is logged.
 
+**Closing an app closes its window**, exactly as clicking X would — the app can
+still ask to save. Nothing is force-killed.
+
+**Cancel means cancel.** Tapping during "thinking" closes the request, and the
+bridge checks for that before running any tool, so a cancelled "launch
+Counter-Strike" never launches.
+
+**Screen, clipboard and photos stay local.** Screenshots go to your Ollama and
+nowhere else; nothing is saved to disk. Turn any of it off with
+`disabled_tools`.
+
 **Bind deliberately.** The default `0.0.0.0` accepts connections from anywhere
 that can reach the port. On a laptop that joins untrusted networks, set `host`
 to your tailnet address so only your own devices can reach it.
@@ -142,8 +178,9 @@ and launch apps. Keep it on a trusted network or a tailnet.
 | `/api/health` | GET | Readiness of Whisper and Ollama. |
 | `/api/models` | GET | Models available from Ollama. |
 | `/api/ask` | POST | Ask a question. Streams newline-delimited JSON. |
-| `/api/stt` | POST | Transcribe raw PCM (s16le, 16 kHz, mono). |
-| `/stt` | WebSocket | Streaming speech, live partials, wake phrase. |
+| `/api/stt` | POST | Transcribe raw PCM (s16le, 16 kHz, mono). `?partial=1&auto=1` also reports end of speech. |
+| `/api/inbox` | GET | Timers that went off, and those still running. |
+| `/stt` | WebSocket | Streaming speech, live partials, auto-send, wake phrase, captions. |
 
 ## Running it at startup
 
@@ -186,6 +223,12 @@ mic levels: now=412 peak=1180 floor=190 threshold=475 speaking=True
 
 If `peak` never rises above `threshold` when you speak, the voice-activity
 thresholds in `wake.py` are too aggressive for your microphone.
+
+**It sends before I've finished** — raise `end_silence_seconds` (1.5 suits people
+who pause a lot), or hold the temple instead of tapping: hold-to-talk never
+auto-sends.
+
+**"What's on my screen" says no vision model** — `ollama pull qwen2.5vl:3b`.
 
 **It won't launch something** — ask it "what apps do I have with <word> in the
 name" to see what was found, and add anything missing under `apps` in your

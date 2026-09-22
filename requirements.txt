@@ -2,3 +2,7 @@ aiohttp
 faster-whisper
 numpy
 zeroconf
+# "What's on my screen?" -- screen capture for the vision model.
+Pillow
+# CPU, memory, disk and battery for "how's my computer doing?".
+psutil

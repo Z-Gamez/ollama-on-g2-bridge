@@ -9,3 +9,7 @@ __pycache__/
 *.log
 .venv/
 venv/
+
+# What you asked it to remember.
+memory.json
+memory.tmp

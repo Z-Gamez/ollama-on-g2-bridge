@@ -18,17 +18,27 @@ from __future__ import annotations
 
 import difflib
 import re
+from collections import deque
 
 import numpy as np
+import vad
 
 SAMPLE_RATE = 16000
 
 # Only the last few seconds can contain the wake phrase.
 WAKE_WINDOW_SECONDS = 5.0
 # Silence that ends a question. Long enough to survive a mid-sentence pause.
-END_SILENCE_SECONDS = 1.3
+END_SILENCE_SECONDS = 1.0
+# After the phrase, how long to wait for the question to start. People pause
+# after "hey ollama" -- ending the capture during that pause lost the question.
+NO_SPEECH_SECONDS = 6.0
 # Hard stop, so a noisy room can't record forever.
 MAX_UTTERANCE_SECONDS = 25.0
+# How often to run the voice detector. Frames arrive far faster than this.
+VAD_INTERVAL_SECONDS = 0.2
+# Keep looking for the phrase this long after speech stops, or "hey ollama"
+# followed by a pause would never be decoded at all.
+WAKE_TAIL_SECONDS = 1.5
 # Below this, treat it as room tone no matter what the noise floor says.
 ABSOLUTE_SILENCE_RMS = 120.0
 
@@ -43,14 +53,19 @@ def frame_rms(pcm: bytes) -> float:
 
 
 class SpeechGate:
-    """Tells speech from room tone, adapting to however loud the room is."""
+    """Loudness, for the diagnostic log line. No longer decides anything.
+
+    It used to gate decoding, and its floor only learned from frames it already
+    judged quiet -- so a room steadily louder than the floor read as speech
+    forever (the log showed floor=215 against a room at ~1000 for minutes).
+    The floor is now a low percentile of recent levels, which follows the room
+    up, and the real speech decisions are made by Silero in vad.py.
+    """
 
     def __init__(self) -> None:
+        self.levels: deque[float] = deque(maxlen=300)
         self.noise_floor = 200.0
         self.speaking = False
-        # Kept for diagnostics: if the wake phrase never triggers, the question
-        # is always "is the gate even seeing speech?", and guessing at mic
-        # levels from the other side of a BLE link is hopeless.
         self.peak_level = 0.0
         self.last_level = 0.0
 
@@ -58,12 +73,9 @@ class SpeechGate:
         level = frame_rms(pcm)
         self.last_level = level
         self.peak_level = max(self.peak_level, level)
-        # Speech has to clear the floor by a good margin; the floor itself only
-        # tracks quiet frames, so talking never drags the threshold up with it.
-        threshold = max(self.noise_floor * 2.5, ABSOLUTE_SILENCE_RMS)
-        self.speaking = level > threshold
-        if not self.speaking:
-            self.noise_floor = 0.95 * self.noise_floor + 0.05 * level
+        self.levels.append(level)
+        self.noise_floor = max(float(np.percentile(self.levels, 15)), 1.0)
+        self.speaking = level > max(self.noise_floor * 2.5, ABSOLUTE_SILENCE_RMS)
         return self.speaking
 
 
@@ -105,15 +117,26 @@ class WakeSession:
     so the socket handler stays a simple loop.
     """
 
-    def __init__(self, phrase: str = "hey ollama") -> None:
+    def __init__(self, phrase: str = "hey ollama", end_silence: float = END_SILENCE_SECONDS) -> None:
         self.phrase = phrase
         self.gate = SpeechGate()
+        self.end_silence = end_silence
         self.listening_buffer = bytearray()   # rolling, for spotting the phrase
-        self.capture_buffer = bytearray()     # everything since the wake
+        self.endpointer = self._new_endpointer()
         self.capturing = False
-        self.silence_seconds = 0.0
-        self.captured_seconds = 0.0
-        self.had_speech = False
+        self.since_vad = 0.0
+        self.since_speech = 999.0
+
+    def _new_endpointer(self) -> vad.Endpointer:
+        return vad.Endpointer(
+            end_silence=self.end_silence,
+            no_speech_timeout=NO_SPEECH_SECONDS,
+            max_seconds=MAX_UTTERANCE_SECONDS,
+        )
+
+    @property
+    def capture_buffer(self) -> bytearray:
+        return self.endpointer.buffer
 
     @property
     def _window_bytes(self) -> int:
@@ -127,41 +150,44 @@ class WakeSession:
         {'action': 'progress', 'pcm': ...}     decode for an interim transcript
         {'action': 'finish', 'pcm': ...}       the question ended; decode it
         """
-        speaking = self.gate.update(pcm)
+        self.gate.update(pcm)
         seconds = len(pcm) / 2 / SAMPLE_RATE
+        self.since_vad += seconds
 
         if not self.capturing:
             self.listening_buffer.extend(pcm)
             if len(self.listening_buffer) > self._window_bytes:
                 del self.listening_buffer[: len(self.listening_buffer) - self._window_bytes]
-            # Only worth decoding once the room has actually made a sound.
-            if speaking:
-                self.had_speech = True
+            self.since_speech += seconds
+            if self.since_vad >= VAD_INTERVAL_SECONDS:
+                self.since_vad = 0.0
+                # Only worth a Whisper decode when a voice -- not a fan, not a
+                # TV hum -- was heard recently.
+                if vad.speaking(bytes(self.listening_buffer[-int(0.5 * SAMPLE_RATE) * 2 :])):
+                    self.since_speech = 0.0
+            if self.since_speech <= WAKE_TAIL_SECONDS:
                 return {"action": "check_wake", "pcm": bytes(self.listening_buffer)}
             return {"action": "none"}
 
-        self.capture_buffer.extend(pcm)
-        self.captured_seconds += seconds
-        self.silence_seconds = 0.0 if speaking else self.silence_seconds + seconds
-
-        ended = self.silence_seconds >= END_SILENCE_SECONDS or self.captured_seconds >= MAX_UTTERANCE_SECONDS
-        if ended:
-            pcm_out = bytes(self.capture_buffer)
-            self.reset()
-            return {"action": "finish", "pcm": pcm_out}
-        return {"action": "progress", "pcm": bytes(self.capture_buffer)}
+        self.endpointer.feed(pcm)
+        if self.since_vad >= VAD_INTERVAL_SECONDS:
+            self.since_vad = 0.0
+            verdict = self.endpointer.check()
+            if verdict != "continue":
+                pcm_out = bytes(self.endpointer.buffer)
+                self.reset()
+                return {"action": "finish", "pcm": pcm_out, "reason": verdict}
+        return {"action": "progress", "pcm": bytes(self.endpointer.buffer)}
 
     def start_capture(self) -> None:
         self.capturing = True
-        self.capture_buffer = bytearray()
-        self.silence_seconds = 0.0
-        self.captured_seconds = 0.0
+        self.endpointer = self._new_endpointer()
         self.listening_buffer = bytearray()
+        self.since_vad = 0.0
 
     def reset(self) -> None:
         self.capturing = False
-        self.capture_buffer = bytearray()
+        self.endpointer = self._new_endpointer()
         self.listening_buffer = bytearray()
-        self.silence_seconds = 0.0
-        self.captured_seconds = 0.0
-        self.had_speech = False
+        self.since_vad = 0.0
+        self.since_speech = 999.0
