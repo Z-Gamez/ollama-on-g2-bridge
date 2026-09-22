@@ -217,6 +217,22 @@ def open_windows() -> str:
     return "Open windows: " + "; ".join(titles[:25]) if titles else "No windows are open."
 
 
+def foreground_window_title() -> str:
+    """Title of the window in front, as context for a screenshot. '' if unknown."""
+    if not IS_WINDOWS:
+        return ""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    length = user32.GetWindowTextLengthW(hwnd)
+    if not hwnd or not length:
+        return ""
+    title = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, title, length + 1)
+    return title.value.strip()
+
+
 def close_app(name: str) -> str:
     """Closes a window the way its X button would -- the app may still ask to save."""
     if IS_WINDOWS:
