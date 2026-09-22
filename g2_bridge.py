@@ -236,21 +236,12 @@ class Transcriber:
 
         raise RuntimeError("No usable device for the Whisper model.")
 
-    @property
-    def can_translate(self) -> bool:
-        # The ".en" models only know English, so they have nothing to translate from.
-        return not str(self.cfg["whisper_model"]).endswith(".en")
-
-    def _transcribe_sync(self, pcm: bytes, task: str = "transcribe") -> str:
+    def _transcribe_sync(self, pcm: bytes) -> str:
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        if task == "translate" and self.can_translate:
-            # Detect the spoken language rather than forcing the configured one.
-            segments, _info = self.model.transcribe(audio, task="translate")
-        else:
-            segments, _info = self.model.transcribe(audio, language=self.cfg["language"])
+        segments, _info = self.model.transcribe(audio, language=self.cfg["language"])
         return "".join(seg.text for seg in segments).strip()
 
-    async def transcribe(self, pcm: bytes, task: str = "transcribe") -> str:
+    async def transcribe(self, pcm: bytes) -> str:
         if self.model is None:
             raise RuntimeError("Whisper model is not loaded")
         seconds = len(pcm) / 2 / SAMPLE_RATE
@@ -259,7 +250,7 @@ class Transcriber:
         # One decode at a time: concurrent calls would contend for the same
         # CTranslate2 model and the GPU it sits on.
         async with self._lock:
-            return await asyncio.to_thread(self._transcribe_sync, pcm, task)
+            return await asyncio.to_thread(self._transcribe_sync, pcm)
 
 
 # --------------------------------------------------------------------------
@@ -280,14 +271,47 @@ def use_imperial(cfg: dict) -> bool:
     return "united states" in name or name.startswith("en_us")
 
 
-def build_system_prompt(app: web.Application, use_tools: bool) -> str:
+NO_TOOLS_PROMPT = (
+    " The model answering right now cannot act on the user's computer: it cannot "
+    "launch or close apps, control music, set timers or save memories. If asked to "
+    "do something like that, say plainly that this model can't, and that they can "
+    "switch to a model with tool support from the glasses menu. Never claim to have "
+    "done it."
+)
+
+
+def build_system_prompt(app: web.Application, use_tools: bool, can_act: bool = True) -> str:
     # A model has no clock. Without this, "what time is it" and "set a timer
     # for 5pm" are answered from nowhere.
     now = datetime.now().strftime("%A, %B %d, %Y, %I:%M %p").replace(" 0", " ")
     prompt = SYSTEM_PROMPT + f" It is currently {now}."
-    if use_tools:
+    if use_tools and can_act:
         prompt += TOOL_PROMPT
+    elif use_tools:
+        # A chat-only model given no instruction happily "launches Steam" in
+        # prose. Tell it the truth so it tells the user the truth.
+        prompt += NO_TOOLS_PROMPT
     return prompt + app["memory"].prompt_block()
+
+
+async def model_capabilities(app: web.Application, name: str) -> list[str]:
+    """What Ollama says a model can do: 'completion', 'tools', 'vision'...
+
+    Cached per model; an empty list means "couldn't tell", which callers treat
+    as capable so an older Ollama without the field keeps working.
+    """
+    cache = app.setdefault("caps_cache", {})
+    if name in cache:
+        return cache[name]
+    caps: list[str] = []
+    try:
+        async with app["http"].post(f"{app['cfg']['ollama_url']}/api/show", json={"model": name}) as resp:
+            if resp.status == 200:
+                caps = (await resp.json()).get("capabilities") or []
+                cache[name] = caps
+    except Exception:
+        pass
+    return caps
 
 
 async def find_vision_model(app: web.Application, preferred: str = "") -> str:
@@ -506,8 +530,16 @@ async def run_agent(app: web.Application, prompt: str, model: str, history: list
         else None
     )
 
+    # Picking a model on the glasses can land on one without tool support (a
+    # vision model, say). Ollama rejects a tools request to those outright, so
+    # it chats instead -- the forced lookups below still give it live data.
+    caps = await model_capabilities(app, model or cfg["ollama_model"])
+    can_call_tools = use_tools and (not caps or "tools" in caps)
+    if use_tools and not can_call_tools:
+        log.info("%s has no tool support; answering without tools", model)
+
     messages = [
-        {"role": "system", "content": build_system_prompt(app, use_tools)},
+        {"role": "system", "content": build_system_prompt(app, use_tools, can_call_tools)},
         *history,
         {"role": "user", "content": prompt},
     ]
@@ -534,10 +566,14 @@ async def run_agent(app: web.Application, prompt: str, model: str, history: list
     if use_tools and not ACTION_RE.search(prompt):
         forced: tuple[str, dict] | None = None
         if WEATHER_RE.search(prompt):
-            # Only when no place is named: "weather in Paris" needs the model to
-            # pull out the city, so that one is left to a normal tool call.
-            if not re.search(r"\b(in|at|for)\s+[A-Z]", prompt):
+            # A named place is normally left to the model, which is better at
+            # pulling out "New York" than a regex. A chat-only model can't call
+            # the tool, though, so for it the regex has to do.
+            named = re.search(r"\b(?:in|at|for)\s+([A-Z][\w.'-]*(?:[ ,]+[A-Z][\w.'-]*)*)", prompt)
+            if not named:
                 forced = ("get_weather", {})
+            elif not can_call_tools:
+                forced = ("get_weather", {"place": named.group(1).strip(" ,")})
         elif NEWS_RE.search(prompt):
             forced = ("get_news", {})
         elif FRESH_RE.search(prompt):
@@ -565,8 +601,8 @@ async def run_agent(app: web.Application, prompt: str, model: str, history: list
             except Exception:
                 log.exception("forced lookup failed")
 
-    for _ in range(MAX_TOOL_ROUNDS if use_tools else 1):
-        if not use_tools:
+    for _ in range(MAX_TOOL_ROUNDS if can_call_tools else 1):
+        if not can_call_tools:
             break
 
         payload = {"model": model or cfg["ollama_model"], "messages": messages, "stream": False, "tools": schemas}
@@ -704,8 +740,18 @@ async def handle_models(request: web.Request) -> web.Response:
             body = await resp.json()
     except Exception as exc:
         raise web.HTTPBadGateway(text=f"Ollama unreachable at {cfg['ollama_url']}: {exc}")
-    names = [m["name"] for m in body.get("models", [])]
-    return web.json_response({"models": names, "default": cfg["ollama_model"]})
+    installed = body.get("models", [])
+    names = [m["name"] for m in installed]
+    # What each model can do, so the glasses' model picker can say "chat only"
+    # before someone picks a model that can't launch apps.
+    details = {
+        m["name"]: {
+            "capabilities": await model_capabilities(request.app, m["name"]),
+            "size_gb": round(m.get("size", 0) / 1e9, 1),
+        }
+        for m in installed
+    }
+    return web.json_response({"models": names, "default": cfg["ollama_model"], "details": details})
 
 
 async def handle_ask(request: web.Request) -> web.StreamResponse:
@@ -879,9 +925,9 @@ async def handle_stt(request: web.Request) -> web.WebSocketResponse:
     caption_line_task: asyncio.Task | None = None
     last_caption_partial = 0.0
 
-    async def decode_line(pcm: bytes, task: str) -> None:
+    async def decode_line(pcm: bytes) -> None:
         try:
-            text = await stt.transcribe(pcm, task)
+            text = await stt.transcribe(pcm)
             if text and not ws.closed:
                 await ws.send_json({"type": "caption", "text": text, "final": True})
         except Exception:
@@ -890,11 +936,10 @@ async def handle_stt(request: web.Request) -> web.WebSocketResponse:
     async def handle_caption_frame(data: bytes) -> None:
         nonlocal caption_line_task, last_caption_partial
         step = caption.add(data)
-        task = "translate" if caption.translate else "transcribe"
         if step["action"] == "line":
             # Decoded in the background so audio keeps flowing into the next
             # line; the transcriber's lock keeps the decodes in order.
-            caption_line_task = asyncio.create_task(decode_line(step["pcm"], task))
+            caption_line_task = asyncio.create_task(decode_line(step["pcm"]))
             last_caption_partial = loop.time()
             return
         if step["action"] != "progress":
@@ -904,7 +949,7 @@ async def handle_stt(request: web.Request) -> web.WebSocketResponse:
         if busy or now - last_caption_partial < PARTIAL_INTERVAL_SECONDS:
             return
         last_caption_partial = now
-        text = await stt.transcribe(step["pcm"], task)
+        text = await stt.transcribe(step["pcm"])
         if text:
             await ws.send_json({"type": "caption", "text": text, "final": False})
     last_level_log = 0.0
@@ -1033,17 +1078,11 @@ async def handle_stt(request: web.Request) -> web.WebSocketResponse:
         kind = control.get("type")
         if kind == "captions":
             if control.get("enabled"):
-                translate = bool(control.get("translate")) and stt.can_translate
-                caption = captions.CaptionSession(translate)
+                caption = captions.CaptionSession()
                 if session is not None:
                     parked_session, session = session, None
-                log.info("captions on%s", " (translating)" if translate else "")
-                await ws.send_json({
-                    "type": "captions",
-                    "enabled": True,
-                    "translate": translate,
-                    "translate_available": stt.can_translate,
-                })
+                log.info("captions on")
+                await ws.send_json({"type": "captions", "enabled": True})
             else:
                 caption = None
                 if parked_session is not None:

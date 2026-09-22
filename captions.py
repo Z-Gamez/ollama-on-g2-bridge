@@ -5,8 +5,7 @@ up as an interim guess while it's being spoken and is replaced by a proper
 decode once the speaker pauses -- the same shape as live TV captions.
 
 Everything runs on your own machine, so a conversation you caption is never
-uploaded anywhere. With a multilingual Whisper model ("small" rather than
-"small.en") Whisper can translate to English as it goes.
+uploaded anywhere.
 """
 
 from __future__ import annotations
@@ -25,8 +24,7 @@ VAD_INTERVAL_SECONDS = 0.2
 
 
 class CaptionSession:
-    def __init__(self, translate: bool = False) -> None:
-        self.translate = translate
+    def __init__(self) -> None:
         self.endpointer = self._fresh()
         self.since_vad = 0.0
 

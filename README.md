@@ -30,7 +30,10 @@ Nothing leaves your network. No cloud, no API keys, no accounts.
 - **Weather** for where your phone is, from Open-Meteo (no key, no account).
 - **News** from RSS, **web search** from DuckDuckGo.
 - **Live captions** — continuous transcription of the people around you, on your
-  lens. With a multilingual Whisper model it translates to English as it goes.
+  lens.
+- **Model switching from the glasses.** `/api/models` reports each model's
+  capabilities; a model without tool support (a vision model, say) chats
+  instead of failing, and says so if asked to act.
 - **Wake phrase** — say "hey ollama" instead of tapping.
 - **Photos** — take one on your phone and ask about it.
 
